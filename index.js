@@ -17,6 +17,7 @@ let bookingCollection;
 let authUserCollection;
 let sessionCollection;
 let accountCollection;
+let favoriteCollection;
 
 // Middleware
 app.use(cors());
@@ -34,6 +35,7 @@ async function run() {
     authUserCollection = db.collection('user'); // Better Auth er user collection
     sessionCollection = db.collection('session'); // Better Auth er session
     accountCollection = db.collection('account'); // Better Auth er account
+    favoriteCollection = db.collection('favorites'); // Customer favorites
 
     console.log('MongoDB Connected Successfully!');
   }  catch (error) {
@@ -59,6 +61,12 @@ async function findUserById(id) {
     ? { $or: [{ _id: new ObjectId(id) }, { id }] }
     : { id };
   return authUserCollection.findOne(filter);
+}
+
+// ID diye equipment khuje ber kore
+async function findEquipmentById(id) {
+  if (!ObjectId.isValid(id)) return null;
+  return equipmentCollection.findOne({ _id: new ObjectId(id) });
 }
 
 // Verify Token Middleware
@@ -117,6 +125,14 @@ const verifyOwner = (req, res, next) => {
 const verifyAdmin = (req, res, next) => {
   if (req.user?.role !== 'admin') {
     return res.status(403).send({ message: 'Forbidden: admins only' });
+  }
+  next();
+};
+
+// Shudhu customer ra dhukte parbe
+const verifyCustomer = (req, res, next) => {
+  if (req.user?.role !== 'customer') {
+    return res.status(403).send({ message: 'Forbidden: customers only' });
   }
   next();
 };
@@ -329,6 +345,203 @@ app.put('/api/profile', verifyToken, async (req, res) => {
     res.send({ message: 'Profile updated' });
   } catch (error) {
     res.status(500).send({ message: 'Failed to update profile' });
+  }
+});
+
+// =====================================================
+// EQUIPMENT: Browse and details (logged in users)
+// =====================================================
+
+// GET: approved equipment (public browse page)
+app.get('/api/equipment', async (req, res) => {
+  try {
+    const result = await equipmentCollection
+      .find({ status: 'approved' })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to get equipment' });
+  }
+});
+
+// GET: single equipment details (public, approved items only)
+app.get('/api/equipment/:id', async (req, res) => {
+  try {
+    const item = await findEquipmentById(req.params.id);
+    if (!item) return res.status(404).send({ message: 'Equipment not found' });
+
+    const status = String(item.status || '').toLowerCase();
+    const isOwner = String(item.ownerId || '') === req.user?.id;
+    const isAdmin = req.user.role === 'admin';
+
+    if (status !== 'approved' && !isOwner && !isAdmin) {
+      return res.status(404).send({ message: 'Equipment not found' });
+    }
+
+    res.send(item);
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to get equipment' });
+  }
+});
+
+// =====================================================
+// CUSTOMER: Favorites
+// =====================================================
+
+// POST: add equipment to current customer's favorites
+app.post('/api/customer/favorites', verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const { equipmentId } = req.body;
+    const id = String(equipmentId || '');
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: 'Invalid equipment id' });
+    }
+
+    const equipment = await findEquipmentById(id);
+    if (!equipment) return res.status(404).send({ message: 'Equipment not found' });
+    if (String(equipment.status || '').toLowerCase() !== 'approved') {
+      return res.status(400).send({ message: 'Only approved equipment can be saved' });
+    }
+
+    const alreadySaved = await favoriteCollection.findOne({
+      customerId: req.user.id,
+      equipmentId: id,
+    });
+    if (alreadySaved) {
+      return res.send({ message: 'Already in favorites' });
+    }
+
+    await favoriteCollection.insertOne({
+      customerId: req.user.id,
+      equipmentId: id,
+      createdAt: new Date(),
+    });
+
+    res.status(201).send({ message: 'Added to favorites' });
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to add favorite' });
+  }
+});
+
+// GET: current customer's favorites with equipment details
+app.get('/api/customer/favorites', verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const favorites = await favoriteCollection
+      .find({ customerId: req.user.id })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const items = await Promise.all(
+      favorites.map(async (favorite) => {
+        const equipment = await findEquipmentById(favorite.equipmentId);
+        if (!equipment) return null;
+        return {
+          ...equipment,
+          _id: String(equipment._id),
+          favoriteId: String(favorite._id),
+          favoritedAt: favorite.createdAt,
+        };
+      })
+    );
+
+    res.send(items.filter(Boolean));
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to get favorites' });
+  }
+});
+
+// DELETE: remove one favorite (customer identity comes from the token)
+app.delete('/api/customer/favorites/:id', verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const result = await favoriteCollection.deleteOne({
+      customerId: req.user.id,
+      equipmentId: req.params.id,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ message: 'Favorite not found' });
+    }
+
+    res.send({ message: 'Removed from favorites' });
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to remove favorite' });
+  }
+});
+
+// =====================================================
+// CUSTOMER: My rentals / bookings
+// =====================================================
+
+// GET: only the logged-in customer's bookings
+app.get('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const result = await bookingCollection
+      .find({ customerId: req.user.id })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to get bookings' });
+  }
+});
+
+// POST: create a booking for the logged-in customer
+app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const { equipmentId, startDate, endDate, quantity } = req.body;
+    const id = String(equipmentId || '');
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: 'Invalid equipment id' });
+    }
+
+    const equipment = await findEquipmentById(id);
+    if (!equipment) return res.status(404).send({ message: 'Equipment not found' });
+    if (String(equipment.status || '').toLowerCase() !== 'approved') {
+      return res.status(400).send({ message: 'This equipment is not available yet' });
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) {
+      return res.status(400).send({ message: 'Invalid rental dates' });
+    }
+
+    const qty = Number(quantity);
+    if (!Number.isInteger(qty) || qty <= 0) {
+      return res.status(400).send({ message: 'Quantity must be a positive whole number' });
+    }
+    if (Number(equipment.quantity || 0) < qty) {
+      return res.status(400).send({ message: 'Requested quantity is not available' });
+    }
+
+    const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / 86400000));
+    const totalAmount = Number(equipment.rentalPrice || 0) * days * qty;
+
+    const newBooking = {
+      customerId: req.user.id,
+      customerName: req.user.name,
+      customerEmail: req.user.email,
+      equipmentId: id,
+      equipmentName: equipment.name,
+      ownerId: String(equipment.ownerId || ''),
+      ownerName: equipment.ownerName || '',
+      ownerEmail: equipment.ownerEmail || '',
+      startDate: start,
+      endDate: end,
+      quantity: qty,
+      totalAmount,
+      paymentStatus: 'unpaid',
+      bookingStatus: 'pending',
+      createdAt: new Date(),
+    };
+
+    const result = await bookingCollection.insertOne(newBooking);
+    res.status(201).send({ success: true, message: 'Booking requested', id: String(result.insertedId) });
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to create booking' });
   }
 });
 
