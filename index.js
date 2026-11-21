@@ -15,6 +15,8 @@ let userCollection;
 let equipmentCollection;
 let bookingCollection;
 let authUserCollection;
+let sessionCollection;
+let accountCollection;
 
 // Middleware
 app.use(cors());
@@ -30,6 +32,8 @@ async function run() {
     equipmentCollection = db.collection('equipment');
     bookingCollection = db.collection('bookings');
     authUserCollection = db.collection('user'); // Better Auth er user collection
+    sessionCollection = db.collection('session'); // Better Auth er session
+    accountCollection = db.collection('account'); // Better Auth er account
 
     console.log('MongoDB Connected Successfully!');
   }  catch (error) {
@@ -105,6 +109,14 @@ const verifyToken = async (req, res, next) => {
 const verifyOwner = (req, res, next) => {
   if (req.user?.role !== 'owner') {
     return res.status(403).send({ message: 'Forbidden: owners only' });
+  }
+  next();
+};
+
+// Shudhu admin ra dhukte parbe
+const verifyAdmin = (req, res, next) => {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).send({ message: 'Forbidden: admins only' });
   }
   next();
 };
@@ -317,6 +329,221 @@ app.put('/api/profile', verifyToken, async (req, res) => {
     res.send({ message: 'Profile updated' });
   } catch (error) {
     res.status(500).send({ message: 'Failed to update profile' });
+  }
+});
+
+
+// =====================================================
+// ADMIN: Page 1 - All Users
+// =====================================================
+
+// GET: shob user
+app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const users = await authUserCollection.find().sort({ createdAt: -1 }).toArray();
+
+    const result = users.map((u) => ({
+      id: String(u._id),
+      name: u.name,
+      email: u.email,
+      role: String(u.role || 'customer').toLowerCase(),
+      createdAt: u.createdAt,
+    }));
+
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to get users' });
+  }
+});
+
+// PATCH: user er role bodlano (customer, owner, admin)
+app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { role } = req.body;
+
+    if (!['customer', 'owner', 'admin'].includes(role)) {
+      return res.status(400).send({ message: 'Role must be customer, owner or admin' });
+    }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid id' });
+    }
+    // Nijer role bodlano jabe na
+    if (req.params.id === req.user.id) {
+      return res.status(403).send({ message: 'You cannot change your own role' });
+    }
+
+    const result = await authUserCollection.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { role, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: 'User not found' });
+    }
+    res.send({ message: `Role updated to ${role}` });
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to update role' });
+  }
+});
+
+// DELETE: user delete (Manage Users)
+app.delete('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid id' });
+    }
+    // Nijeke delete kora jabe na
+    if (req.params.id === req.user.id) {
+      return res.status(403).send({ message: 'You cannot delete yourself' });
+    }
+
+    const id = req.params.id;
+    const result = await authUserCollection.deleteOne({ _id: new ObjectId(id) });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ message: 'User not found' });
+    }
+
+    // Oi user er login session ar account o muche dao
+    await sessionCollection.deleteMany({ userId: { $in: [id, new ObjectId(id)] } });
+    await accountCollection.deleteMany({ userId: { $in: [id, new ObjectId(id)] } });
+
+    res.send({ message: 'User deleted' });
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to delete user' });
+  }
+});
+
+// =====================================================
+// ADMIN: Page 2 - All Equipment
+// =====================================================
+
+// GET: shob equipment
+app.get('/api/admin/equipment', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const result = await equipmentCollection.find().sort({ createdAt: -1 }).toArray();
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to get equipment' });
+  }
+});
+
+// PATCH: Approve / Reject
+app.patch('/api/admin/equipment/:id/status', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { status } = req.body;
+
+    if (!['approved', 'rejected', 'pending'].includes(status)) {
+      return res.status(400).send({ message: 'Invalid status' });
+    }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid id' });
+    }
+
+    const result = await equipmentCollection.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { status, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: 'Equipment not found' });
+    }
+    res.send({ message: `Equipment ${status}` });
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to update status' });
+  }
+});
+
+// PUT: Update (admin je kono equipment update korte pare)
+app.put('/api/admin/equipment/:id', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid id' });
+    }
+
+    const updatedData = {};
+    for (const field of allowedFields) {
+      if (req.body[field] !== undefined) updatedData[field] = req.body[field];
+    }
+
+    const result = await equipmentCollection.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { ...updatedData, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: 'Equipment not found' });
+    }
+    res.send({ message: 'Equipment updated' });
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to update equipment' });
+  }
+});
+
+// DELETE: Delete
+app.delete('/api/admin/equipment/:id', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid id' });
+    }
+
+    const result = await equipmentCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ message: 'Equipment not found' });
+    }
+    res.send({ message: 'Equipment deleted' });
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to delete equipment' });
+  }
+});
+
+// =====================================================
+// ADMIN: Page 3 - All Rentals
+// =====================================================
+
+// GET: shob booking (owner er naam na thakle database theke ene dei)
+app.get('/api/admin/bookings', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const bookings = await bookingCollection.find().sort({ createdAt: -1 }).toArray();
+
+    const result = await Promise.all(
+      bookings.map(async (b) => {
+        if (b.ownerName || !b.ownerId) return b;
+        const owner = await findUserById(b.ownerId);
+        return { ...b, ownerName: owner?.name, ownerEmail: owner?.email };
+      })
+    );
+
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to get bookings' });
+  }
+});
+
+// PATCH: booking status bodlano
+app.patch('/api/admin/bookings/:id/status', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { status } = req.body;
+
+    if (!['pending', 'confirmed', 'completed', 'cancelled', 'rejected'].includes(status)) {
+      return res.status(400).send({ message: 'Invalid status' });
+    }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid id' });
+    }
+
+    const result = await bookingCollection.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { bookingStatus: status, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: 'Booking not found' });
+    }
+    res.send({ message: 'Booking updated' });
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to update booking' });
   }
 });
 
