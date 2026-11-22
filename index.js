@@ -545,7 +545,7 @@ app.get('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res) 
 // POST: create a booking for the logged-in customer
 app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res) => {
   try {
-    const { equipmentId, startDate, endDate, quantity } = req.body;
+    const { equipmentId, startDate, endDate, quantity, phone, deliveryAddress, notes } = req.body;
     const id = String(equipmentId || '');
 
     if (!ObjectId.isValid(id)) {
@@ -573,7 +573,14 @@ app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res)
     }
 
     const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / 86400000));
-    const totalAmount = Number(equipment.rentalPrice || 0) * days * qty;
+    // Rental type hishebe unit hisob: Daily -> day, Weekly -> week, Monthly -> month.
+    const rentalType = String(equipment.rentalType || 'Daily').toLowerCase();
+    const units = rentalType === 'weekly'
+      ? Math.max(1, Math.ceil(days / 7))
+      : rentalType === 'monthly'
+      ? Math.max(1, Math.ceil(days / 30))
+      : days;
+    const totalAmount = Number(equipment.rentalPrice || 0) * units * qty;
 
     const newBooking = {
       customerId: req.user.id,
@@ -587,6 +594,9 @@ app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res)
       startDate: start,
       endDate: end,
       quantity: qty,
+      phone: String(phone || ''),
+      deliveryAddress: String(deliveryAddress || ''),
+      notes: String(notes || ''),
       totalAmount,
       paymentStatus: 'unpaid',
       bookingStatus: 'pending',
@@ -594,7 +604,7 @@ app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res)
     };
 
     const result = await bookingCollection.insertOne(newBooking);
-    res.status(201).send({ success: true, message: 'Booking requested', id: String(result.insertedId) });
+    res.status(201).send({ success: true, message: 'Booking requested', id: String(result.insertedId), totalAmount });
   } catch (error) {
     res.status(500).send({ message: 'Failed to create booking' });
   }
