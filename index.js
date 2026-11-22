@@ -17,7 +17,7 @@ if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
 
 const app = express();
 const port = process.env.PORT || 5000;
-const frontendUrl = 'http://localhost:3000';
+const frontendUrl =  process.env.FRONTEND_URL || 'http://localhost:3000';;
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const client = new MongoClient(process.env.MONGO_DB_URL);
@@ -32,7 +32,13 @@ let favoriteCollection;
 let paymentCollection;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    'https://rental-client-wine.vercel.app'
+  ],
+  credentials: true
+}));
 // Stripe needs the exact raw body for signature verification.
 app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }));
 app.use(express.json());
@@ -72,8 +78,8 @@ app.get('/', (req, res) => {
 });
 
 // JWT Public Key
-const JWKS = createRemoteJWKSet(
-  new URL('http://localhost:3000/api/auth/jwks')
+const JWKSt  = createRemoteJWKSet(
+  new URL(`${backendUrl}/api/auth/jwks`)
 );
 
 // Id diye database theke user khuje ber kore
@@ -107,8 +113,8 @@ async function getOptionalUser(req) {
   try {
     const token = authHeader.split(' ')[1];
     const { payload } = await jwtVerify(token, JWKS, {
-      issuer: 'http://localhost:3000',
-      audience: 'http://localhost:3000',
+      issuer: backendUrl,
+      audience: backendUrl,
     });
     const dbUser = await findUserById(payload.sub || payload.id);
     if (!dbUser) return null;
