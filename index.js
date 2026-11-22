@@ -400,10 +400,19 @@ app.put('/api/profile', verifyToken, async (req, res) => {
 // GET: approved equipment (public browse page)
 app.get('/api/equipment', async (req, res) => {
   try {
-    const result = await equipmentCollection
+    // Homepage ke jonno chobi limit kora jay; baire default behavior one bojay thake.
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(Math.floor(requestedLimit), 6)
+      : 0;
+
+    let query = equipmentCollection
       .find({ status: { $in: ['Approved', 'approved'] } })
-      .sort({ createdAt: -1 })
-      .toArray();
+      .sort({ createdAt: -1 });
+
+    if (limit > 0) query = query.limit(limit);
+
+    const result = await query.toArray();
     res.send(result);
   } catch (error) {
     res.status(500).send({ message: 'Failed to get equipment' });
