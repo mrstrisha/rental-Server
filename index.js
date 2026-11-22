@@ -8,19 +8,36 @@ import Stripe from 'stripe';
 import { fileURLToPath } from 'url';
 
 dotenv.config();
-// Stripe keys live in the frontend .env; dotenv does not override existing values.
+// Local monorepo convenience only; Vercel uses project environment variables.
 dotenv.config({ path: fileURLToPath(new URL('../equipmentrental/.env', import.meta.url)) });
-
-if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
-  throw new Error('Missing required Stripe configuration');
-}
 
 const app = express();
 const port = process.env.PORT || 5000;
-const frontendUrl =  process.env.FRONTEND_URL || 'http://localhost:3000';;
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const frontendUrl = process.env.FRONTEND_URL || process.env.BETTER_AUTH_URL || 'http://localhost:3000';
+// Better Auth signs JWTs with BETTER_AUTH_URL; verification must use the same value.
+const authUrl = process.env.BETTER_AUTH_URL || frontendUrl;
 
-const client = new MongoClient(process.env.MONGO_DB_URL);
+let stripe;
+function getStripe() {
+  if (!stripe) {
+    if (!process.env.STRIPE_SECRET_KEY) {
+      throw new Error('STRIPE_SECRET_KEY is not configured');
+    }
+    stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+  }
+  return stripe;
+}
+
+let client;
+function getMongoClient() {
+  if (!client) {
+    if (!process.env.MONGO_DB_URL) {
+      throw new Error('MONGO_DB_URL is not configured');
+    }
+    client = new MongoClient(process.env.MONGO_DB_URL);
+  }
+  return client;
+}
 
 let userCollection;
 let equipmentCollection;
@@ -35,8 +52,9 @@ let paymentCollection;
 app.use(cors({
   origin: [
     'http://localhost:3000',
-    'https://rental-client-wine.vercel.app'
-  ],
+    'https://rental-client-wine.vercel.app',
+    frontendUrl,
+  ].filter(Boolean),
   credentials: true
 }));
 // Stripe needs the exact raw body for signature verification.
@@ -46,7 +64,7 @@ app.use(express.json());
 // MongoDB Connection
 async function run() {
   try {
-    await client.connect();
+    await getMongoClient().connect();
 
     const db = client.db('equipment_rental');
     userCollection = db.collection('users');
@@ -71,15 +89,37 @@ async function run() {
   }
 }
 
+let dbReady;
+function ensureDb() {
+  if (!dbReady) {
+    dbReady = run().catch((error) => {
+      dbReady = null;
+      throw error;
+    });
+  }
+  return dbReady;
+}
+
 
 // Test Route
 app.get('/', (req, res) => {
   res.send('Equipment Rental Platform Server is Running!');
 });
 
+// Serverless-safe database initialization (cached per warm instance).
+app.use(async (req, res, next) => {
+  try {
+    await ensureDb();
+    next();
+  } catch (error) {
+    console.error('Database initialization failed:', error.message);
+    res.status(500).send({ message: 'Database is not available' });
+  }
+});
+
 // JWT Public Key
-const JWKSt  = createRemoteJWKSet(
-  new URL(`${backendUrl}/api/auth/jwks`)
+const JWKS = createRemoteJWKSet(
+  new URL(`${authUrl}/api/auth/jwks`)
 );
 
 // Id diye database theke user khuje ber kore
@@ -113,8 +153,8 @@ async function getOptionalUser(req) {
   try {
     const token = authHeader.split(' ')[1];
     const { payload } = await jwtVerify(token, JWKS, {
-      issuer: backendUrl,
-      audience: backendUrl,
+      issuer: authUrl,
+      audience: authUrl,
     });
     const dbUser = await findUserById(payload.sub || payload.id);
     if (!dbUser) return null;
@@ -732,7 +772,7 @@ app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res)
     const totalAmount = Number(equipment.rentalPrice || 0) * units * qty;
     const bookingId = new ObjectId();
 
-    const session = await stripe.checkout.sessions.create({
+    const session = await getStripe().checkout.sessions.create({
       mode: 'payment',
       line_items: [
         {
@@ -801,7 +841,7 @@ app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res)
     });
   } catch (error) {
     if (createdSessionId) {
-      await stripe.checkout.sessions.expire(createdSessionId).catch(() => {});
+      await getStripe().checkout.sessions.expire(createdSessionId).catch(() => {});
     }
     console.error('Checkout session creation failed:', error.message);
     res.status(500).send({ message: 'Could not start payment' });
@@ -1034,9 +1074,13 @@ app.post('/api/webhooks/stripe', async (req, res) => {
     return res.status(400).send({ message: 'Missing Stripe signature' });
   }
 
+  if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
+    return res.status(500).send({ message: 'Stripe is not configured' });
+  }
+
   let event;
   try {
-    event = stripe.webhooks.constructEvent(req.body, signature, process.env.STRIPE_WEBHOOK_SECRET);
+    event = getStripe().webhooks.constructEvent(req.body, signature, process.env.STRIPE_WEBHOOK_SECRET);
   } catch {
     return res.status(400).send({ message: 'Invalid Stripe webhook signature' });
   }
@@ -1064,10 +1108,18 @@ app.post('/api/webhooks/stripe', async (req, res) => {
   }
 });
 
+// Vercel best practice: keep function state predictable on unhandled errors.
+app.use((err, req, res, next) => {
+  console.error('Unhandled route error:', err.message);
+  if (!res.headersSent) {
+    res.status(500).send({ message: 'Internal server error' });
+  }
+});
+
 // Server
 async function startServer() {
   try {
-    await run();
+    await ensureDb();
 
     if (!equipmentCollection) {
       throw new Error("Equipment collection initialization failed");
@@ -1082,4 +1134,9 @@ async function startServer() {
   }
 }
 
-startServer();
+// Vercel invokes the exported handler; local development still uses app.listen.
+if (process.env.VERCEL !== '1') {
+  startServer();
+}
+
+export default app;
