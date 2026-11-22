@@ -69,6 +69,40 @@ async function findEquipmentById(id) {
   return equipmentCollection.findOne({ _id: new ObjectId(id) });
 }
 
+// Status gulo ek-i format e rakhar jonno
+function normalizeStatus(value) {
+  const status = String(value || '').toLowerCase();
+  if (status === 'approved') return 'Approved';
+  if (status === 'rejected') return 'Rejected';
+  if (status === 'pending') return 'Pending';
+  return '';
+}
+
+// Public details page a login thakle user chine (login na thakle null)
+async function getOptionalUser(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+
+  try {
+    const token = authHeader.split(' ')[1];
+    const { payload } = await jwtVerify(token, JWKS, {
+      issuer: 'http://localhost:3000',
+      audience: 'http://localhost:3000',
+    });
+    const dbUser = await findUserById(payload.sub || payload.id);
+    if (!dbUser) return null;
+
+    return {
+      id: String(dbUser._id),
+      name: dbUser.name,
+      email: dbUser.email,
+      role: String(dbUser.role || 'customer').toLowerCase(),
+    };
+  } catch {
+    return null;
+  }
+}
+
 // Verify Token Middleware
 const verifyToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -161,6 +195,7 @@ app.post("/api/owner/equipment", verifyToken, verifyOwner, async (req, res) => {
       ownerId: req.user.id || req.user.sub,
       status: "Pending",
       createdAt: new Date(),
+      updatedAt: new Date(),
     };
 
     const result = await equipmentCollection.insertOne(newEquipment);
@@ -258,11 +293,21 @@ app.put('/api/owner/equipment/:id', verifyToken, verifyOwner, async (req, res) =
       if (req.body[field] !== undefined) updatedData[field] = req.body[field];
     }
 
+    const currentStatus = normalizeStatus(item.status) || 'Pending';
+    const importantChanged = allowedFields.some((field) =>
+      updatedData[field] !== undefined && String(updatedData[field]) !== String(item[field] ?? '')
+    );
+    const nextStatus = currentStatus === 'Approved' && importantChanged ? 'Pending' : currentStatus;
+
     await equipmentCollection.updateOne(
       { _id: item._id },
-      { $set: { ...updatedData, updatedAt: new Date() } }
+      { $set: { ...updatedData, status: nextStatus, updatedAt: new Date() } }
     );
-    res.send({ message: 'Equipment updated' });
+    res.send({
+      message: 'Equipment updated',
+      status: nextStatus,
+      reapprovalRequired: currentStatus === 'Approved' && importantChanged,
+    });
   } catch (error) {
     res.status(500).send({ message: 'Failed to update equipment' });
   }
@@ -356,7 +401,7 @@ app.put('/api/profile', verifyToken, async (req, res) => {
 app.get('/api/equipment', async (req, res) => {
   try {
     const result = await equipmentCollection
-      .find({ status: 'approved' })
+      .find({ status: { $in: ['Approved', 'approved'] } })
       .sort({ createdAt: -1 })
       .toArray();
     res.send(result);
@@ -371,9 +416,10 @@ app.get('/api/equipment/:id', async (req, res) => {
     const item = await findEquipmentById(req.params.id);
     if (!item) return res.status(404).send({ message: 'Equipment not found' });
 
+    const user = await getOptionalUser(req);
     const status = String(item.status || '').toLowerCase();
-    const isOwner = String(item.ownerId || '') === req.user?.id;
-    const isAdmin = req.user.role === 'admin';
+    const isOwner = String(item.ownerId || '') === user?.id;
+    const isAdmin = user?.role === 'admin';
 
     if (status !== 'approved' && !isOwner && !isAdmin) {
       return res.status(404).send({ message: 'Equipment not found' });
@@ -644,9 +690,9 @@ app.get('/api/admin/equipment', verifyToken, verifyAdmin, async (req, res) => {
 // PATCH: Approve / Reject
 app.patch('/api/admin/equipment/:id/status', verifyToken, verifyAdmin, async (req, res) => {
   try {
-    const { status } = req.body;
+    const status = normalizeStatus(req.body.status);
 
-    if (!['approved', 'rejected', 'pending'].includes(status)) {
+    if (!status) {
       return res.status(400).send({ message: 'Invalid status' });
     }
     if (!ObjectId.isValid(req.params.id)) {
