@@ -4,10 +4,21 @@ import dotenv from 'dotenv';
 import { MongoClient } from 'mongodb';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { ObjectId } from 'mongodb';
+import Stripe from 'stripe';
+import { fileURLToPath } from 'url';
+
 dotenv.config();
+// Stripe keys live in the frontend .env; dotenv does not override existing values.
+dotenv.config({ path: fileURLToPath(new URL('../equipmentrental/.env', import.meta.url)) });
+
+if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
+  throw new Error('Missing required Stripe configuration');
+}
 
 const app = express();
 const port = process.env.PORT || 5000;
+const frontendUrl = 'http://localhost:3000';
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const client = new MongoClient(process.env.MONGO_DB_URL);
 
@@ -18,9 +29,12 @@ let authUserCollection;
 let sessionCollection;
 let accountCollection;
 let favoriteCollection;
+let paymentCollection;
 
 // Middleware
 app.use(cors());
+// Stripe needs the exact raw body for signature verification.
+app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 // MongoDB Connection
@@ -36,6 +50,13 @@ async function run() {
     sessionCollection = db.collection('session'); // Better Auth er session
     accountCollection = db.collection('account'); // Better Auth er account
     favoriteCollection = db.collection('favorites'); // Customer favorites
+    paymentCollection = db.collection('payments'); // Stripe payment transactions
+
+    await paymentCollection.createIndex({ stripeSessionId: 1 }, { unique: true });
+    await paymentCollection.createIndex(
+      { stripePaymentIntentId: 1 },
+      { unique: true, partialFilterExpression: { stripePaymentIntentId: { $type: 'string' } } }
+    );
 
     console.log('MongoDB Connected Successfully!');
   }  catch (error) {
@@ -526,6 +547,115 @@ app.delete('/api/customer/favorites/:id', verifyToken, verifyCustomer, async (re
 });
 
 // =====================================================
+// STRIPE HELPERS
+// =====================================================
+
+function stripeObjectId(value) {
+  if (!value) return null;
+  return typeof value === 'string' ? value : value.id || null;
+}
+
+function bookingIdFromSession(session) {
+  const reference = session.client_reference_id || session.metadata?.bookingId;
+  return ObjectId.isValid(reference) ? new ObjectId(reference) : null;
+}
+
+async function markCheckoutSessionPaid(session) {
+  const bookingId = bookingIdFromSession(session);
+  if (!bookingId) return;
+
+  const booking = await bookingCollection.findOne({ _id: bookingId });
+  if (!booking) return;
+
+  const paymentIntentId = stripeObjectId(session.payment_intent);
+  const amountPaid = Number(session.amount_total || 0) / 100;
+  const nextBookingStatus = booking.bookingStatus === 'cancelled' ? 'cancelled' : 'confirmed';
+
+  await bookingCollection.updateOne(
+    { _id: bookingId, paymentStatus: { $ne: 'paid' } },
+    {
+      $set: {
+        paymentStatus: 'paid',
+        bookingStatus: nextBookingStatus,
+        stripeSessionId: session.id,
+        stripePaymentIntentId: paymentIntentId,
+        amountPaid,
+        currency: session.currency || 'usd',
+        paidAt: new Date(),
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  await paymentCollection.updateOne(
+    { stripeSessionId: session.id },
+    {
+      $setOnInsert: {
+        bookingId,
+        customerId: booking.customerId,
+        customerEmail: booking.customerEmail,
+        equipmentId: booking.equipmentId,
+        equipmentName: booking.equipmentName,
+        stripeSessionId: session.id,
+        currency: session.currency || 'usd',
+        createdAt: new Date(),
+      },
+      $set: {
+        stripePaymentIntentId: paymentIntentId,
+        amount: amountPaid,
+        status: 'paid',
+        bookingStatus: nextBookingStatus,
+        updatedAt: new Date(),
+      },
+    },
+    { upsert: true }
+  );
+}
+
+async function markCheckoutSessionUnpaid(session, status) {
+  const bookingId = bookingIdFromSession(session);
+  if (!bookingId) return;
+
+  const booking = await bookingCollection.findOne({ _id: bookingId });
+  if (!booking) return;
+
+  await bookingCollection.updateOne(
+    { _id: bookingId, paymentStatus: { $ne: 'paid' } },
+    {
+      $set: {
+        paymentStatus: 'unpaid',
+        bookingStatus: 'cancelled',
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  await paymentCollection.updateOne(
+    { stripeSessionId: session.id },
+    {
+      $setOnInsert: {
+        bookingId,
+        customerId: booking.customerId,
+        customerEmail: booking.customerEmail,
+        equipmentId: booking.equipmentId,
+        equipmentName: booking.equipmentName,
+        stripeSessionId: session.id,
+        currency: session.currency || 'usd',
+        createdAt: new Date(),
+      },
+      $set: {
+        stripePaymentIntentId: stripeObjectId(session.payment_intent),
+        amount: Number(session.amount_total || 0) / 100,
+        status,
+        bookingStatus: 'cancelled',
+        updatedAt: new Date(),
+      },
+    },
+    { upsert: true }
+  );
+}
+
+// =====================================================
 // CUSTOMER: My rentals / bookings
 // =====================================================
 
@@ -542,8 +672,10 @@ app.get('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res) 
   }
 });
 
-// POST: create a booking for the logged-in customer
+// POST: validate booking, create a Stripe Checkout Session, then store the pending booking
 app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res) => {
+  let createdSessionId = null;
+
   try {
     const { equipmentId, startDate, endDate, quantity, phone, deliveryAddress, notes } = req.body;
     const id = String(equipmentId || '');
@@ -572,6 +704,16 @@ app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res)
       return res.status(400).send({ message: 'Requested quantity is not available' });
     }
 
+    const overlappingBooking = await bookingCollection.findOne({
+      equipmentId: id,
+      bookingStatus: { $nin: ['cancelled', 'rejected'] },
+      startDate: { $lte: end },
+      endDate: { $gte: start },
+    });
+    if (overlappingBooking) {
+      return res.status(400).send({ message: 'Equipment is already booked for these dates' });
+    }
+
     const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / 86400000));
     // Rental type hishebe unit hisob: Daily -> day, Weekly -> week, Monthly -> month.
     const rentalType = String(equipment.rentalType || 'Daily').toLowerCase();
@@ -580,9 +722,43 @@ app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res)
       : rentalType === 'monthly'
       ? Math.max(1, Math.ceil(days / 30))
       : days;
+    // Amount is always calculated here from stored equipment data; frontend totals are ignored.
     const totalAmount = Number(equipment.rentalPrice || 0) * units * qty;
+    const bookingId = new ObjectId();
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: equipment.name || 'Equipment rental',
+              description: `${units} ${rentalType} unit(s) x ${qty}`,
+            },
+            unit_amount: Math.round(Number(equipment.rentalPrice || 0) * 100),
+          },
+          quantity: units * qty,
+        },
+      ],
+      client_reference_id: String(bookingId),
+      customer_email: req.user.email,
+      metadata: {
+        bookingId: String(bookingId),
+        equipmentId: id,
+        customerId: String(req.user.id),
+      },
+      success_url: `${frontendUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}&canceled=1`,
+    });
+
+    createdSessionId = session.id;
+    if (!session.url) {
+      throw new Error('Stripe did not return a checkout URL');
+    }
 
     const newBooking = {
+      _id: bookingId,
       customerId: req.user.id,
       customerName: req.user.name,
       customerEmail: req.user.email,
@@ -598,15 +774,31 @@ app.post('/api/customer/bookings', verifyToken, verifyCustomer, async (req, res)
       deliveryAddress: String(deliveryAddress || ''),
       notes: String(notes || ''),
       totalAmount,
+      stripeSessionId: session.id,
+      stripePaymentIntentId: null,
+      stripeAmountTotal: Number(session.amount_total || 0) / 100,
+      currency: session.currency || 'usd',
       paymentStatus: 'unpaid',
       bookingStatus: 'pending',
       createdAt: new Date(),
+      updatedAt: new Date(),
     };
 
-    const result = await bookingCollection.insertOne(newBooking);
-    res.status(201).send({ success: true, message: 'Booking requested', id: String(result.insertedId), totalAmount });
+    await bookingCollection.insertOne(newBooking);
+    res.status(201).send({
+      success: true,
+      message: 'Checkout session created',
+      checkoutUrl: session.url,
+      sessionId: session.id,
+      bookingId: String(bookingId),
+      totalAmount,
+    });
   } catch (error) {
-    res.status(500).send({ message: 'Failed to create booking' });
+    if (createdSessionId) {
+      await stripe.checkout.sessions.expire(createdSessionId).catch(() => {});
+    }
+    console.error('Checkout session creation failed:', error.message);
+    res.status(500).send({ message: 'Could not start payment' });
   }
 });
 
@@ -825,6 +1017,46 @@ app.patch('/api/admin/bookings/:id/status', verifyToken, verifyAdmin, async (req
   }
 });
 
+
+// =====================================================
+// STRIPE WEBHOOK
+// =====================================================
+
+app.post('/api/webhooks/stripe', async (req, res) => {
+  const signature = req.headers['stripe-signature'];
+  if (!signature) {
+    return res.status(400).send({ message: 'Missing Stripe signature' });
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, signature, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch {
+    return res.status(400).send({ message: 'Invalid Stripe webhook signature' });
+  }
+
+  try {
+    if (
+      event.type === 'checkout.session.completed' ||
+      event.type === 'checkout.session.async_payment_succeeded'
+    ) {
+      const session = event.data.object;
+      if (session.payment_status === 'paid') {
+        await markCheckoutSessionPaid(session);
+      }
+    } else if (
+      event.type === 'checkout.session.expired' ||
+      event.type === 'checkout.session.async_payment_failed'
+    ) {
+      await markCheckoutSessionUnpaid(event.data.object, 'failed');
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    console.error('Stripe webhook processing failed:', error.message);
+    res.status(500).send({ message: 'Webhook processing failed' });
+  }
+});
 
 // Server
 async function startServer() {
