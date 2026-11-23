@@ -5,7 +5,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { MongoClient } from 'mongodb';
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createRemoteJWKSet, jwtVerify, decodeJwt } from 'jose';
 import { ObjectId } from 'mongodb';
 import Stripe from 'stripe';
 import { fileURLToPath } from 'url';
@@ -16,9 +16,35 @@ dotenv.config({ path: fileURLToPath(new URL('../equipmentrental/.env', import.me
 
 const app = express();
 const port = process.env.PORT || 5000;
-const frontendUrl = process.env.FRONTEND_URL || process.env.BETTER_AUTH_URL || 'http://localhost:3000';
+const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
+const defaultFrontendUrl = isProduction
+  ? 'https://rental-client-wine.vercel.app'
+  : 'http://localhost:3000';
+const frontendUrl = process.env.FRONTEND_URL || process.env.BETTER_AUTH_URL || defaultFrontendUrl;
 // Better Auth signs JWTs with BETTER_AUTH_URL; verification must use the same value.
 const authUrl = process.env.BETTER_AUTH_URL || frontendUrl;
+
+// Log only claim names/codes and the expected origin. Never log the token itself.
+function logJwtFailure(context, error, token) {
+  let tokenIssuer;
+  let tokenAudience;
+  try {
+    const decoded = decodeJwt(token);
+    tokenIssuer = decoded.iss;
+    tokenAudience = decoded.aud;
+  } catch {
+    // Token was not decodable; nothing safe to add.
+  }
+
+  console.error('[auth] JWT verification failed', {
+    context,
+    code: error?.code || error?.name || 'UnknownError',
+    message: String(error?.message || '').slice(0, 200),
+    expectedIssuer: authUrl,
+    tokenIssuer,
+    tokenAudience,
+  });
+}
 
 let stripe;
 function getStripe() {
@@ -165,7 +191,7 @@ async function getOptionalUser(req) {
     const dbUser = await findUserById(payload.sub || payload.id);
 
     if (!dbUser) {
-      console.log("User not found:", payload.sub || payload.id);
+      console.warn('[auth] JWT validated but user lookup failed (optional auth)');
       return null;
     }
 
@@ -177,7 +203,7 @@ async function getOptionalUser(req) {
     };
 
   } catch (error) {
-    console.error("JWT verification error:", error);
+    logJwtFailure('optional', error, authHeader.split(' ')[1]);
     return null;
   }
 }
@@ -195,12 +221,9 @@ const verifyToken = async (req, res, next) => {
   const token = authHeader.split(' ')[1];
 
   try {
-     const authUrl =
-    process.env.BETTER_AUTH_URL || "http://localhost:3000";
-
     const { payload } = await jwtVerify(token, JWKS, {
-       issuer: authUrl,
-    audience: authUrl,
+      issuer: authUrl,
+      audience: authUrl,
     });
 
     // Token thik, ebar database theke asol user ar tar role ana
@@ -221,7 +244,7 @@ const verifyToken = async (req, res, next) => {
 
     next();
   } catch (error) {
-    console.log(error);
+    logJwtFailure('required', error, token);
 
     return res.status(401).send({
       message: 'Invalid or expired token',
