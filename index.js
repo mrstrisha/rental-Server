@@ -151,16 +151,23 @@ function normalizeStatus(value) {
 // Public details page a login thakle user chine (login na thakle null)
 async function getOptionalUser(req) {
   const authHeader = req.headers.authorization;
+
   if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
 
   try {
     const token = authHeader.split(' ')[1];
+
     const { payload } = await jwtVerify(token, JWKS, {
       issuer: authUrl,
       audience: authUrl,
     });
+
     const dbUser = await findUserById(payload.sub || payload.id);
-    if (!dbUser) return null;
+
+    if (!dbUser) {
+      console.log("User not found:", payload.sub || payload.id);
+      return null;
+    }
 
     return {
       id: String(dbUser._id),
@@ -168,7 +175,9 @@ async function getOptionalUser(req) {
       email: dbUser.email,
       role: String(dbUser.role || 'customer').toLowerCase(),
     };
-  } catch {
+
+  } catch (error) {
+    console.error("JWT verification error:", error);
     return null;
   }
 }
