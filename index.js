@@ -183,9 +183,12 @@ const verifyToken = async (req, res, next) => {
   const token = authHeader.split(' ')[1];
 
   try {
+     const authUrl =
+    process.env.BETTER_AUTH_URL || "http://localhost:3000";
+
     const { payload } = await jwtVerify(token, JWKS, {
-      issuer: 'http://localhost:3000',
-      audience: 'http://localhost:3000',
+       issuer: authUrl,
+    audience: authUrl,
     });
 
     // Token thik, ebar database theke asol user ar tar role ana
